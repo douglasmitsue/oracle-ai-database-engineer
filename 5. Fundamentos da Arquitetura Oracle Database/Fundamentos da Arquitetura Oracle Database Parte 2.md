@@ -1,0 +1,484 @@
+# Laboratório Prático 1 — Missão: Deep Dive no Banco de Dados Oracle
+
+> **Objetivo da Missão:** explorar a arquitetura de um banco de dados Oracle.
+
+> Ao final deste laboratório, você terá visto com os próprios olhos **onde os dados moram**, **quem os movimenta**, **como a memória é organizada**, **como as transações são protegidas** e **como o banco nasce e morre** a cada startup e shutdown.
+
+> Este não é um laboratório para decorar comandos e sim um laboratório para **enxergar o Oracle funcionando por dentro**.
+
+---
+
+## Sumário
+
+0. [Objetivos de Aprendizagem](#0-objetivos-de-aprendizagem)
+1. [Preparação do Ambiente (Docker + DBeaver)](#1-preparação-do-ambiente-docker--dbeaver)
+2. [Missão 1 — Instância vs Banco de Dados](#2-missão-1--instância-vs-banco-de-dados)
+3. [Missão 2 — Estrutura Lógica: Tablespaces, Segmentos, Extensões e Blocos](#3-missão-2--estrutura-lógica-tablespaces-segmentos-extensões-e-blocos)
+4. [Missão 3 — Memória: SGA e PGA](#4-missão-3--memória-sga-e-pga)
+5. [Missão 4 — Background Processes](#5-missão-4--background-processes)
+6. [Missão 5 — Buffer Cache e Redo Log Buffer](#6-missão-5--buffer-cache-e-redo-log-buffer)
+7. [Missão 6 — Undo e Transações](#7-missão-6--undo-e-transações)
+8. [Missão 7 — Dicionário de Dados](#8-missão-7--dicionário-de-dados)
+9. [Missão 8 — Usuários, Schemas e Privilégios](#9-missão-8--usuários-schemas-e-privilégios)
+10. [Missão 9 — Startup e Shutdown](#10-missão-9--startup-e-shutdown)
+11. [Missão 10 - Desafio Final — Deep Dive Integrado](#11-desafio-final--deep-dive-integrado)
+12. [Limpeza do Ambiente](#12-limpeza-do-ambiente)
+
+---
+
+## 0. Objetivos de Aprendizagem
+
+Ao concluir este laboratório, você será capaz de:
+
+- Diferenciar, na prática, **instância** (memória + processos) de **banco de dados** (arquivos em disco).
+- Navegar pela **hierarquia lógica de armazenamento** (tablespace → segmento → extensão → bloco) e relacioná-la aos datafiles físicos.
+- Inspecionar os componentes da **SGA** e da **PGA** em tempo real.
+- Identificar os **background processes** fundamentais (DBWn, LGWR, CKPT, SMON, PMON) e entender o que cada um está fazendo.
+- Observar o **Buffer Cache** e o **Redo Log Buffer** em ação durante operações DML.
+- Acompanhar como o **Undo** viabiliza rollback e leitura consistente.
+- Consultar o **Dicionário de Dados** usando as famílias `DBA_*`, `ALL_*`, `USER_*` e `V$`.
+- Criar usuários, conceder privilégios e trabalhar com roles.
+- Abrir e fechar uma **PDB** passando pelos estágios `MOUNT` e `OPEN`.
+
+---
+
+## 1. Preparação do Ambiente (Docker + DBeaver)
+
+> Siga os passos desta seção **apenas uma vez**. A partir da Missão 1, o contêiner estará rodando e você trabalhará majoritariamente no DBeaver.
+
+### 1.1. Pré-requisitos
+
+- **Docker Desktop** instalado e **em execução**.
+- **DBeaver Community** instalado.
+- Pelo menos **4 GB de RAM livres** para o contêiner.
+- Porta `1521` livre na máquina hospedeira.
+
+### 1.2. Subindo o contêiner do Oracle 23ai Free
+
+Abra o terminal (ou o PowerShell) e execute:
+
+```bash
+docker run -d \
+  --name oracle \
+  --hostname oracledb \
+  -p 1521:1521 \
+  -e ORACLE_PWD=<altere para um password> \
+  -e ORACLE_CHARACTERSET=AL32UTF8 \
+  -v oracle-26ai-data:/opt/oracle/oradata \
+  --restart unless-stopped \
+  container-registry.oracle.com/database/free:23.26.1.0
+```
+
+A primeira inicialização pode levar de **5 a 10 minutos** — o Oracle precisa criar o CDB e a PDB. 
+
+### 1.3. Teste rápido via SQL*Plus 
+
+```bash
+docker exec -it oracle sqlplus system/<altere para o password definido no comando docker>//localhost:1521/FREEPDB1
+```
+
+Dentro do SQL*Plus, rode:
+
+```sql
+SELECT 'Oracle respondendo!' AS status FROM dual;
+EXIT;
+```
+
+### 1.4. Configurando o DBeaver
+
+Crie **duas conexões distintas** — usaremos ambas ao longo do laboratório:
+
+**Conexão A — PDB de trabalho (uso cotidiano):**
+
+| Campo           | Valor                       |
+| --------------- | --------------------------- |
+| Nome            | `Oracle FREEPDB1`           |
+| Host            | `localhost`                 |
+| Port            | `1521`                      |
+| Database        | `FREEPDB1`                  |
+| Connection Type | `Service Name`              |
+| Username        | `system`                    |
+| Password        | `<altere para um password>` |
+
+**Conexão B — CDB raiz (administração):**
+
+| Campo           | Valor                       |
+| --------------- | --------------------------- |
+| Nome            | `Oracle CDB FREE`           |
+| Host            | `localhost`                 |
+| Port            | `1521`                      |
+| Database        | `FREE`                      |
+| Connection Type | `Service Name`              |
+| Username        | `system`                    |
+| Password        | `<altere para um password>` |
+
+> **Nota:** o Oracle 23ai é **multitenant**. A conexão `FREE` acessa o **CDB raiz** (container root), onde vivem os usuários comuns a todo o banco; a conexão `FREEPDB1` acessa a **Pluggable Database**, que é o ambiente isolado onde vamos criar schemas, tabelas e transações.
+
+---
+
+## 2. Missão 1 — Instância vs Banco de Dados
+
+> **Conceito central:** a **instância** é viva e efêmera (memória + processos); o **banco de dados** é persistente (arquivos em disco). Vamos enxergar os dois separadamente.
+
+**Abra a conexão `Oracle CDB FREE`** no DBeaver.
+
+### 2.1. Identificando a instância
+
+```sql
+-- Quem sou eu? (identidade da instância)
+SELECT instance_name,
+       host_name,
+       version_full,
+       startup_time,
+       status,
+       database_status
+FROM   v$instance;
+```
+
+**Nota:** o `startup_time` mostra **quando a instância acordou** — é o momento em que a memória foi alocada. Se reiniciarmos o contêiner, esse valor muda; o banco em si não.
+
+### 2.2. Identificando o banco de dados
+
+```sql
+-- Identidade do banco (a parte persistente)
+SELECT name,
+       dbid,
+       created,
+       log_mode,
+       open_mode,
+       cdb
+FROM   v$database;
+```
+
+**Nota:** repare que `CREATED` é muito mais antigo do que `STARTUP_TIME` da query anterior. Isso é a prova concreta: o banco existe **há dias**, a instância atual só **há minutos**.
+
+### 2.3. Os arquivos físicos que compõem o banco
+
+```sql
+-- Datafiles: onde os dados moram
+SELECT FILE#, bytes/1024/1024 AS mb, name
+FROM   v$datafile
+ORDER BY FILE#;
+
+-- Control files: o "mapa" do banco
+SELECT name FROM v$controlfile;
+
+-- Redo log files: o histórico de mudanças
+SELECT group#, member FROM v$logfile ORDER BY group#;
+```
+
+**Observação:** os caminhos apontam para dentro do contêiner (`/opt/oracle/oradata/...`). Esse diretório está mapeado para o **volume Docker `oracle-26ai-data`**. Mesmo que o contêiner seja destruído, os arquivos sobrevivem no volume e é justamente isso que diferencia a parte persistente (banco) da parte volátil (instância).
+
+---
+
+## 3. Missão 2 — Estrutura Lógica: Tablespaces, Segmentos, Extensões e Blocos
+
+> **Conceito central:** Oracle organiza os dados em **quatro camadas lógicas**: tablespace → segmento → extensão → bloco. Vamos percorrer essa hierarquia de cima para baixo.
+
+**Troque para a conexão `Oracle FREEPDB1`**.
+
+### 3.1. Camada 1 — Tablespaces
+
+```sql
+SELECT tablespace_name,
+       status,
+       contents,
+       extent_management,
+       segment_space_management,
+       block_size
+FROM   dba_tablespaces
+ORDER BY tablespace_name;
+```
+
+Compare agora com os datafiles associados a cada tablespace:
+
+```sql
+SELECT t.tablespace_name,
+       d.file_name,
+       ROUND(d.bytes/1024/1024, 2) AS mb,
+       d.autoextensible
+FROM   dba_tablespaces t
+JOIN   dba_data_files  d ON d.tablespace_name = t.tablespace_name
+ORDER BY t.tablespace_name;
+```
+
+**Nota:** observe que **tablespace é lógico**, mas cada uma está ancorada em **um ou mais datafiles físicos**. É o ponto onde o mundo lógico toca o mundo físico.
+
+### 3.2. Criando um ambiente de trabalho
+
+Vamos criar uma tablespace própria, um usuário e uma tabela para observar as camadas seguintes.
+
+```sql
+-- 1) Criar uma tablespace dedicada ao laboratório
+CREATE TABLESPACE dsa_lab_ts
+  DATAFILE '/opt/oracle/oradata/FREE/FREEPDB1/dsa_lab_ts01.dbf'
+  SIZE 50M
+  AUTOEXTEND ON NEXT 10M MAXSIZE 200M
+  EXTENT MANAGEMENT LOCAL
+  SEGMENT SPACE MANAGEMENT AUTO;
+
+-- 2) Criar o usuário do laboratório
+CREATE USER dsalab IDENTIFIED BY lab123
+  DEFAULT TABLESPACE dsa_lab_ts
+  QUOTA UNLIMITED ON dsa_lab_ts;
+
+GRANT CONNECT, RESOURCE TO dsalab;
+GRANT CREATE SESSION, CREATE TABLE, CREATE VIEW TO dsalab;
+```
+
+> **Importante:** crie também uma **terceira conexão** no DBeaver chamada `Oracle LAB` usando o usuário `dsalab`/`lab123` contra o `FREEPDB1`. Usaremos ela nas próximas missões.
+
+### 3.3. Camada 2 e 3 — Segmentos e Extensões
+
+Na conexão `Oracle LAB`, crie uma tabela e insira dados o suficiente para forçar novas extensões:
+
+```sql
+CREATE TABLE vendas (
+  id        NUMBER        GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  cliente   VARCHAR2(100),
+  produto   VARCHAR2(100),
+  valor     NUMBER(12,2),
+  data_hora TIMESTAMP DEFAULT SYSTIMESTAMP
+);
+
+-- Gera 50 mil linhas para forçar o crescimento do segmento
+INSERT INTO dsalab.vendas (cliente, produto, valor)
+SELECT 'Cliente_' || LEVEL,
+       'Produto_' || MOD(LEVEL, 100),
+       DBMS_RANDOM.VALUE(10, 5000)
+FROM   dual
+CONNECT BY LEVEL <= 50000;
+
+COMMIT;
+```
+
+Agora volte à conexão `Oracle FREEPDB1` (usuário `system`) e observe os segmentos:
+
+```sql
+-- Segmento da tabela VENDAS
+SELECT owner, segment_name, segment_type,
+       tablespace_name, bytes/1024 AS kb, extents, blocks
+FROM   dba_segments
+WHERE  owner = 'DSALAB';
+
+-- Extensões daquele segmento
+SELECT segment_name, extent_id, bytes/1024 AS kb, blocks
+FROM   dba_extents
+WHERE  owner = 'DSALAB'
+  AND  segment_name = 'VENDAS'
+ORDER BY extent_id;
+```
+
+**Nota:** um **segmento** (a tabela `VENDAS`) é formado por várias **extensões** e cada extensão é um conjunto **contíguo de blocos**. Quando a tabela precisou de mais espaço, o Oracle alocou uma nova extensão inteira, nunca um bloco isolado.
+
+### 3.4. Camada 4 — Blocos
+
+```sql
+-- Tamanho do bloco padrão do banco
+SELECT name, value
+FROM   v$parameter
+WHERE  name = 'db_block_size';
+
+-- Quantos blocos a tabela efetivamente ocupa
+SELECT segment_name, blocks, bytes
+FROM   dba_segments
+WHERE  segment_name = 'VENDAS' AND owner = 'DSALAB';
+```
+
+---
+
+## 4. Missão 3 — Memória: SGA e PGA
+
+> **Conceito central:** SGA é **memória compartilhada**, usada por todos os processos da instância. PGA é **memória privada** de cada sessão.
+
+Conecte-se como `system` no `FREEPDB1` (ou no CDB — as `V$` mostram as mesmas informações de memória).
+
+### 4.1. Visão macro da memória
+
+```sql
+SELECT name, ROUND(value/1024/1024, 2) AS mb
+FROM   v$sga;
+```
+
+### 4.2. Componentes detalhados da SGA
+
+```sql
+SELECT component,
+       ROUND(current_size/1024/1024, 2) AS current_mb,
+       ROUND(min_size/1024/1024, 2)     AS min_mb,
+       ROUND(max_size/1024/1024, 2)     AS max_mb
+FROM   v$sga_dynamic_components
+WHERE  current_size > 0
+ORDER BY current_size DESC;
+```
+
+**Componentes:**
+
+| Componente         | Para que serve                                              |
+|--------------------|-------------------------------------------------------------|
+| **DEFAULT buffer cache** | Cache de blocos de dados lidos do disco                |
+| **shared pool**    | Library cache (SQL parseado) + dictionary cache             |
+| **large pool**     | Alocações grandes (RMAN, paralelismo, shared server)        |
+| **java pool**      | Objetos Java dentro do banco                                |
+| **redo log buffer**| Onde o redo é montado antes de ir ao disco                  |
+
+### 4.3. PGA — memória privada das sessões
+
+```sql
+SELECT name, ROUND(value/1024/1024, 2) AS mb
+FROM   v$pgastat
+WHERE  name IN ('total PGA allocated',
+                'total PGA inuse',
+                'total PGA used for auto workareas',
+                'maximum PGA allocated');
+```
+
+Agora veja **quanto de PGA cada sessão está consumindo**:
+
+```sql
+SELECT s.sid, s.username, s.program,
+       ROUND(p.pga_used_mem/1024/1024, 2)  AS pga_used_mb,
+       ROUND(p.pga_alloc_mem/1024/1024, 2) AS pga_alloc_mb
+FROM   v$session s
+JOIN   v$process p ON p.addr = s.paddr
+WHERE  s.username IS NOT NULL
+ORDER BY p.pga_alloc_mem DESC;
+```
+
+---
+
+## 5. Missão 4 — Background Processes
+
+> **Conceito central:** o Oracle não é só memória é também um exército de **processos invisíveis** que trabalham 24/7 para garantir desempenho, consistência e durabilidade.
+
+### 5.1. Vendo os processos por dentro do banco
+
+```sql
+SELECT name AS processo, description
+FROM   v$bgprocess
+WHERE  paddr <> '00'
+ORDER BY name;
+```
+
+### 5.2. Encontrando os "Cinco Fundamentais"
+
+```sql
+SELECT name, description
+FROM   v$bgprocess
+WHERE  name IN ('DBW0','LGWR','CKPT','SMON','PMON');
+```
+
+| Processo | Função resumida                                                                   |
+|----------|------------------------------------------------------------------------------------|
+| **DBW0** | Escreve blocos sujos do buffer cache para os datafiles (em lotes).                 |
+| **LGWR** | Escreve o redo do log buffer para os redo log files (a cada commit, 3s, 1/3 full).|
+| **CKPT** | Atualiza control file e headers de datafiles marcando o último ponto consistente. |
+| **SMON** | Recovery automático após crash, limpeza de segmentos temporários.                 |
+| **PMON** | Limpeza após morte anormal de processos: rollback + liberação de locks.           |
+
+### 5.3. Vendo os mesmos processos pelo lado do sistema operacional
+
+Abra um novo terminal no host (sem fechar o DBeaver):
+
+```bash
+docker exec -it oracle bash -c "ps -ef | grep -E 'db_(dbw|lgwr|ckpt|smon|pmon)' | grep -v grep"  
+```
+
+**Nota:** o que aparece dentro do `V$BGPROCESS` é o mesmo processo que aparece no `ps` do Linux. Não há mágica: o Oracle é um conjunto de processos de sistema operacional que compartilham uma área de memória (a SGA).
+
+---
+
+## 6. Missão 5 — Buffer Cache e Redo Log Buffer
+
+> **Conceito central:** toda leitura passa pelo **Buffer Cache**. Toda mudança passa pelo **Redo Log Buffer**. Vamos vê-los aquecendo em tempo real.
+
+Use a conexão `FREEPDB1`.
+
+### 6.1. Primeiro: estatísticas de I/O lógico vs físico
+
+```sql
+SELECT name, value
+FROM   v$sysstat
+WHERE  name IN ('db block gets',
+                'consistent gets',
+                'physical reads',
+                'redo entries',
+                'redo size');
+```
+
+### 6.2. Forçando leitura do disco (cache frio)
+
+```sql
+-- Esvazia o buffer cache (precisa de privilégio ALTER SYSTEM,
+-- logo rode isto conectado como SYSTEM no FREEPDB1)
+ALTER SYSTEM FLUSH BUFFER_CACHE;
+
+-- De volta como DSALAB, primeira leitura (vai para o disco)
+SELECT COUNT(*) FROM vendas WHERE valor > 2500;
+```
+
+### 6.3. Segunda leitura (cache quente)
+
+```sql
+-- Execute imediatamente depois
+SELECT COUNT(*) FROM vendas WHERE valor > 2500;
+```
+
+**Nota:** a segunda execução é dramaticamente mais rápida. Por quê? Porque agora os blocos estão no **Buffer Cache** e o Oracle nem tocou no disco.
+
+Confirme com as estatísticas:
+
+```sql
+SELECT name, value
+FROM   v$sysstat
+WHERE  name IN ('db block gets',
+                'consistent gets',
+                'physical reads',
+                'redo entries',
+                'redo size');
+```
+
+Os valores de `consistent gets` subiram (leitura do buffer), mas os `physical reads` praticamente não.
+
+### 6.4. O Cache Hit Ratio
+
+```sql
+SELECT ROUND(
+  (1 - (phy.value / (cur.value + con.value))) * 100, 2
+) AS cache_hit_ratio_pct
+FROM   v$sysstat cur,
+       v$sysstat con,
+       v$sysstat phy
+WHERE  cur.name = 'db block gets'
+  AND  con.name = 'consistent gets'
+  AND  phy.name = 'physical reads';
+```
+
+**Meta profissional para OLTP:** acima de **95%**.
+
+### 6.5. Redo Log Buffer em ação
+
+```sql
+-- Estado inicial
+SELECT name, value
+FROM   v$sysstat
+WHERE  name IN ('redo entries','redo size','redo buffer allocation retries');
+
+-- Como DSALAB: gere muito redo
+BEGIN
+  FOR i IN 1..5000 LOOP
+    UPDATE vendas SET valor = valor * 1.01 WHERE id = i;
+  END LOOP;
+  COMMIT;
+END;
+
+-- Estado final
+SELECT name, value
+FROM   v$sysstat
+WHERE  name IN ('redo entries','redo size','redo buffer allocation retries');
+```
+
+**Nota:** observe que `redo entries` e `redo size` aumentaram. Se `redo buffer allocation retries` **também** aumenta, é sinal clássico de **log buffer subdimensionado** — LGWR não está conseguindo drenar o buffer na velocidade necessária.
+
+-- Continuaremos o Lab 1 no próximo capítulo.
+
