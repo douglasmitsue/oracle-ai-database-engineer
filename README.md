@@ -37,6 +37,17 @@ O objetivo é construir um portfólio técnico que demonstre competências em:
 - Engenharia de Software
 - Automação
 ---
+# Status deste repositório
+
+| Projetos | Status |
+|--------|--------|
+| Oracle AI Database Engineer | 🚧 Em andamento |
+| SQL Server & Azure SQL | ⏳ Planejado |
+| NoSQL Engineering | ⏳ Planejado |
+| Agentic Database Engineer | ⏳ Planejado |
+| SQL para Data Science | ⏳ Planejado |
+
+---
 
 # A Transformação Digital na Era da Inteligência Artificial
 
@@ -348,18 +359,6 @@ Meu objetivo é atuar em projetos de alta complexidade envolvendo:
 - Database Automation
 - Data Platform Modernization
 - Enterprise Data Architecture
-
----
-
-# Status deste repositório
-
-| Curso | Status |
-|--------|--------|
-| Oracle AI Database Engineer | 🚧 Em andamento |
-| SQL Server & Azure SQL | ⏳ Planejado |
-| NoSQL Engineering | ⏳ Planejado |
-| Agentic Database Engineer | ⏳ Planejado |
-| SQL para Data Science | ⏳ Planejado |
 
 ---
 
